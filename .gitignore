@@ -1,0 +1,11 @@
+# Build files
+/target
+
+# Lock file (optional for binaries)
+Cargo.lock
+
+# macOS
+.DS_Store
+
+# Version backup files (local learning only)
+src/main_v*.rs
