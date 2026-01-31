@@ -8,11 +8,36 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use prometheus::{Counter, Histogram, Gauge, Encoder, TextEncoder, register_counter, register_histogram, register_gauge};
 use lazy_static::lazy_static;
+use clap::Parser; // for cli
 
 
-// ollama's constant URL
-const OLLAMA_URL: &str = "http://localhost:11434";
-const CACHE_TTL_SECONDS: u64 = 360;
+//cli argument structure
+#[derive(Parser, Debug)]
+#[command(name = "ollama gateway")]
+#[command(about = "High performance caching proxy for ollama")]
+struct Args {
+    //port to run the server on
+    #[arg(short, long, default_value_t = 8080)]
+    port: u16,
+    
+    //ollama server url
+    #[arg(short, long, default_value = "http://localhost:11434")]
+    ollama_url: String,
+    
+    //Cache TTL in seconds
+    #[arg(short, long, default_value_t = 30)]
+    cache_ttl: u64,
+    
+    //Rate limit max req per window
+    #[arg(long, default_value_t = 10)]
+    rate_limit: u32,
+    
+    //Rate limit window in seconds
+    #[arg(long, default_value_t = 60)]
+    rate_window: u64
+}
+
+// remvooing constatnt as they now will come from CLI directly
 
 // Defining metrics globally using lazy_static
 lazy_static! {
@@ -42,39 +67,59 @@ lazy_static! {
     ).unwrap();
 }
 
+
 // cache entry with timestamp
 struct CacheEntry {
     response: String,
     created_at: Instant,
+}
+//Rate limimt entry
+struct RateLimitEntry {
+    count: u32,
+    window_start: Instant,
 }
 // app's shared state
 struct AppState {
     client: reqwest::Client,
     cache: DashMap<String, CacheEntry>, // String -> CacheEntry
     ttl: Duration,                      // how long cache will be valid
+    ollama_url: String,
+    rate_limiter: DashMap<String, RateLimitEntry>,
+    rate_limit: u32, // max request allowed
+    rate_window: Duration, // Duration of rate limit
 }
 
 // this is main async function with tokio
 #[tokio::main]
 async fn main() {
+    // parse cli arguments
+    let args = Args::parse();
+
     // creating shared state
     let state = Arc::new(AppState {
         client: reqwest::Client::new(),
         cache: DashMap::new(),
-        ttl: Duration::from_secs(CACHE_TTL_SECONDS),
+        ttl: Duration::from_secs(args.cache_ttl),
+        ollama_url: args.ollama_url.clone(),
+        rate_limiter: DashMap::new(),
+        rate_limit: args.rate_limit,
+        rate_window: Duration::from_secs(args.rate_window),
     });
 
     //creating the router with rooutes
     let app = Router::new()
-        .route("/hello", get(hello_handler))
+        .route("/health", get(health_handler))
         .route("/api/generate", post(generate_handler)) // post route
         .route("/metrics", get(metrics_handler))// metrics endpoint
         .with_state(state); // put client in state
 
-    // start the server on port 8080
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await.unwrap();
-    println!("Gateway running on http://localhost:8080");
-    println!("Forwarding to Ollama at {}", OLLAMA_URL);
+    let addr = format!("0.0.0.0:{}", args.port);
+    let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
+
+    println!("Gateway running on http://localhost:{}", args.port);
+    println!("Forwarding to Ollama at {}", args.ollama_url);
+    println!("Cache TTL: {} seconds", args.cache_ttl);
+    println!("Rate limit: {} requests per {} seconds", args.rate_limit, args.rate_window);
     axum::serve(listener, app).await.unwrap();
 }
 
@@ -86,9 +131,6 @@ async fn metrics_handler() -> impl IntoResponse {
     String::from_utf8(buffer).unwrap()
 }
 
-async fn hello_handler() -> &'static str {
-    "Hello, world!"
-}
 
 // Ollama API request format
 #[derive(Deserialize, Serialize, Clone)]
@@ -113,6 +155,38 @@ fn make_cache_key(req: &GenerateRequest) -> String {
     hasher.update(&req.prompt);
     format!("{:x}", hasher.finalize())
 }
+// health handler
+async fn health_handler() -> impl IntoResponse {
+    Json(serde_json::json!({
+        "status": "healthy",
+        "timestamp": chrono::Utc::now().to_rfc3339()
+    }))
+}
+
+// rate limimt function
+fn check_rate_limit(state: &AppState, ip: &str) -> bool {
+    let now = Instant::now();
+
+    let mut entry = state.rate_limiter
+    .entry(ip.to_string())
+    .or_insert(RateLimitEntry { count: 0, window_start: now, });
+
+    //windows expired..? Reset it
+    if entry.window_start.elapsed() > state.rate_window {
+        entry.count = 1;
+        entry.window_start = now;
+        return true;
+    }
+
+    // under limit.? Allow
+    if entry.count < state.rate_limit {
+        entry.count += 1;
+        return true;
+    }
+
+    //over limit
+    false
+}
 
 //post handler
 async fn generate_handler(
@@ -122,6 +196,9 @@ async fn generate_handler(
 
     //track request
     REQUEST_TOTAL.inc();
+    if !check_rate_limit(&state, "global") {
+        return Err("Rate limit exceeded. Try again later.".to_string());
+    }
     let start_time = Instant::now();
     // create a cache key
     let cache_key = make_cache_key(&payload);
@@ -151,7 +228,7 @@ async fn generate_handler(
     // send request to ollama
     let ollama_response = state
         .client
-        .post(format!("{}/api/generate", OLLAMA_URL))
+        .post(format!("{}/api/generate", state.ollama_url))
         .json(&payload)
         .send()
         .await
